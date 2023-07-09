@@ -1,189 +1,241 @@
-## Generate Nim structures according to a `.xsd` file. The output is a string.
+import
+    std/[
+        options,
+    ],
 
-# FAQ: Why not generate Nim structures through a macro? Cannot do so because
-# Nim doesn't allow `ref` types for compile-time execution, and `XmlNode` is a
-# `ref` type. The low-level XML parser `std/parsexml` uses streams, which are
-# `ref` types as well.
-
-import std/[
-    options,
-    sequtils,
-    strformat,
-    strtabs,
-    strutils,
-    sugar,
-    xmltree,
-]
-import zero_functional
-import xsdtonim/[helpers, normalizer]
-
-# {{{1 Helpers
-
-func withPrefix(s, prefix: string): string =
-    ## Prepends `s` with `prefix` if `s` is not empty
-    if s != "":
-        prefix & s
-    else:
-        ""
-
-func pragmasToStr(pragmas: openArray[string]): string =
-    if pragmas.len > 0:
-        "{.$#.}" % [pragmas.join(", ")]
-    else:
-        ""
-
-func normalizeCustomTypeName(ty: string): string =
-    ty.capitalizeAscii
-
-func normalizeTypeNameOf(ty: XsdType): string =
-    if ty.isPrimitive:
-        ty.primitive.asNimType
-    else:
-        ty.name.normalizeCustomTypeName
-
-func wrapTypeOfElement(tyName: string, arity: XsdArity): string =
-    let format = if arity.isOptionElement:
-        "Option[$#]"
-    elif arity.isSeqElement:
-        &"seq[$#]"
-    else:
-        "$#"
-    format % [tyName]
-
-# {{{1 Enum gen
-
-func toEnumPrefix*(name: string): string =
-    ## Tries to find the text to prefix each enum variant by inspecting the
-    ## type name (`name`).
-    let chars = name.toOpenArray(0, name.len - 1).toSeq
-    chars -->
-        filter(it in {'A'..'Z'}).
-        map(it.toLowerAscii).
-        fold(newString(0), a & it)
-
-func formatEnumVariant(name, prefix: string): string =
-    let ident = prefix & name.nimIdentNormalize
-    &"{ident} = \"{name}\""
-
-func genEnumVariant(xsd: XsdNode, prefix: string): string =
-    xsd.expectKind xnkEnumeration
-    let variant = xsd.enumValue.formatEnumVariant(prefix)
-    let docs = xsd.docs.withPrefix(" ## ")
-    variant & docs
-
-# {{{1 Object gen
-
-func genObjFieldDocs(xsd: XsdNode, arity: XsdArity): string =
-    let baseDocs =
-        if arity.isSeqElement and not arity.isOptionElement:
-            &"Length is {arity.min}..{arity.max}."
-        else:
-            ""
-    let docs = baseDocs & xsd.docs.withPrefix(" ")
-    docs.withPrefix(" ## ")
-
-func genObjField(xsd: XsdNode): string =
-    xsd.expectKind xnkElement
-    let
-        xmlName = xsd.name
-        name = block:
-            var name = xmlName.normalizeCustomTypeName
-            name[0] = name[0].toLowerAscii
-            name
-        tyName = xsd.ty.normalizeTypeNameOf
-        arity = xsd.elemArity
-        wrapper = tyName.wrapTypeOfElement(arity)
-        docs = xsd.genObjFieldDocs(arity)
-    var pragmas = @[&"xmlName: \"{xmlName}\""]
-    if xsd.attrs.contains"flatten":
-        pragmas.add "xmlFlatten"
-    &"{name}* {pragmas.pragmasToStr}: {wrapper}{docs}"
-
-func formatObjectVariant(idx: int, field: string): string =
-    &"of {idx}: {field}"
-
-func genObjectUnion(xsd: XsdNode): string =
-    xsd.expectKind xnkChoice
-    let variants = xsd.subnodes -->
-        enumerate().
-        map(formatObjectVariant(it.idx, it.elem.genObjField).indent(2)).
-        reduce(it.accu & "\n" & it.elem)
-    "case choice* {.xmlSkip.}: byte\n" & variants & "\n  else: discard"
-
-# {{{1 Top-level gen
-
-# TODO: Handle xsd:pattern, xsd:minLength, xsd:maxLength
-func genSimpleType*(xsd: XsdNode): string =
-    ## Generate enum from simpleType/restriction on xsd:string. Input is the
-    ## `xsd:simpleType` node.
-    func fmtDocs(docs: string): string = docs.withPrefix "\n  ## "
-    xsd.expectKind xnkSimpleType
-    let
-        name = xsd.name.normalizeCustomTypeName
-        restrictNode = (xsd.subnodes --> find(it.kind == xnkRestriction)).get
-        baseDocs = xsd.docs
-        impl =
-            if restrictNode.isEnumRestriction:
-                let prefix = name.toEnumPrefix
-                let enumValues = restrictNode.subnodes -->
-                    map(it.genEnumVariant(prefix).indent(2)).
-                    reduce(it.accu & "\n" & it.elem)
-                &"enum{baseDocs.fmtDocs}\n{enumValues}"
-            else:
-                let nimType = restrictNode.baseTy.asNimType
-                let docs =
-                    if restrictNode.isRangeRestriction:
-                        let (min, max) = restrictNode.getRangeRestriction
-                        baseDocs & &". Number may be between {min} and {max}."
-                    else:
-                        baseDocs
-                &"{nimType}{docs.fmtDocs}"
-    &"{name}* = {impl}"
-
-func genComplexType*(xsd: XsdNode): string =
-    ## Generates the type implementation for the "complexType" in `xsd`.
-    doAssert xsd.kind == xnkComplexType
-    let name = xsd.name.normalizeCustomTypeName
-    let seqSubs = xsd.elemsOfComplexType
-    assert seqSubs.countIt(it.kind == xnkChoice) <= 1, "Max 1 union (choice) in complex type"
-    let fields = seqSubs -->
-        filter(it.kind == xnkElement).
-        map(it.genObjField.indent(2)).
-        reduce(it.accu & "\n" & it.elem)
-    let union = (seqSubs -->
-        find(it.kind == xnkChoice)).
-        map(x => x.genObjectUnion.indent(2)).
-        get("")
-    let recList = [fields, union] -->
-        filter(it != "").
-        reduce(it[0] & '\n' & it[1])
-    &"{name}* = object\n" & recList
-
-func parseXsdToNim*(xml: XmlNode): string =
-    let xsd = xml.simpleParseXsd.standardizeXsd
-    doAssert xsd.allIt(it.kind in {xnkSimpleType, xnkComplexType, xnkElement})
-    let simples = xsd -->
-        filter(it.kind == xnkSimpleType).
-        map(it.genSimpleType.indent(2)).
-        reduce(it.accu & "\n" & it.elem)
-    let complex = xsd -->
-        filter(it.kind == xnkComplexType).
-        map(it.genComplexType.indent(2)).
-        reduce(it.accu & "\n" & it.elem)
-    &"""
-import std/[options, times]
-import xmlserde
+    xmlserde
 
 type
-{simples}
-{complex}
-"""
+    XsElement = object
+        name {.xmlAttr.}: string
+        minOccurs {.xmlAttr.}: Option[int]
+        maxOccurs {.xmlAttr.}: Option[string]
+        default {.xmlAttr.}: Option[string]
+        annotation {.xmlName: "xs:annotation".}: Option[XsAnnotation]
+
+        # Either...
+        typ {.xmlName: "type", xmlAttr.}: Option[string]
+        # OR ...
+        simpleType {.xmlName: "xs:simpleType".}: Option[XsSimpleType]
+
+    XsChoice = object
+        element {.xmlName: "xs:element".}: seq[XsElement]
+        minOccurs {.xmlAttr.}: Option[int]
+
+    XsSequence = object
+        element* {.xmlName: "xs:element".}: seq[XsElement]
+        choice* {.xmlName: "xs:choice".}: seq[XsChoice]
+        sequence* {.xmlName: "xs:sequence".}: seq[XsSequence]
+
+    XsAttribute = object
+        name {.xmlAttr.}: string
+        typ {.xmlAttr, xmlName: "type".}: string
+        use {.xmlAttr.}: string
+
+    XsExtension = object
+        base {.xmlAttr.}: string
+        attribute {.xmlName: "xs:attribute".}: seq[XsAttribute]
+
+    XsSimpleContent = object
+        extension {.xmlName: "xs:extension".}: XsExtension
+
+    XsComplexType = object
+        name {.xmlAttr.}: string
+        sequence {.xmlName: "xs:sequence".}: Option[XsSequence]
+        simpleContent {.xmlName: "xs:simpleContent".}: Option[XsSimpleContent]
+        annotation {.xmlName: "xs:annotation".}: Option[XsAnnotation]
+
+    XsEnumeration = object
+        value {.xmlAttr.}: string
+        annotation {.xmlName: "xs:annotation".}: Option[XsAnnotation]
+
+    XsStringValue = object
+        value {.xmlAttr.}: string
+
+    XsIntValue = object
+        value {.xmlAttr.}: int
+
+    XsRestriction = object
+        base {.xmlAttr.}: string
+        enumeration {.xmlName: "xs:enumeration".}: seq[XsEnumeration]
+            # string simpleType
+        pattern {.xmlName: "xs:pattern".}: Option[XsStringValue]
+            # string simpleType
+
+        fractionDigits {.xmlName: "xs:fractionDigits".}: Option[XsIntValue]
+        totalDigits {.xmlName: "xs:totalDigits".}: Option[XsIntValue]
+        minInclusive {.xmlName: "xs:minInclusive".}: Option[XsIntValue]
+            # decimal simpleType
+
+        minLength {.xmlName: "xs:minLength".}: Option[XsIntValue]
+        maxLength {.xmlName: "xs:maxLength".}: Option[XsIntValue]
+            # string simpleType
+
+    XsDocumentation = object
+        text {.xmlText.}: string
+
+    XsAnnotation = object
+        documentation {.xmlName: "xs:documentation".}: XsDocumentation
+
+    XsSimpleType = object
+        name {.xmlAttr.}: Option[string]
+            # none when nested inside an element node
+        restriction {.xmlName: "xs:restriction".}: XsRestriction
+        annotation {.xmlName: "xs:annotation".}: Option[XsAnnotation]
+
+    XsSchema = object
+        element {.xmlName: "xs:element".}: seq[XsElement]
+        complexType {.xmlName: "xs:complexType".}: seq[XsComplexType]
+        simpleType {.xmlName: "xs:simpleType".}: seq[XsSimpleType]
+
+import
+    std/[
+        macros,
+        sequtils,
+        strformat,
+        strutils,
+        json,
+        jsonutils,
+    ],
+
+    results
+
+# {{{1 helpers
+
+iterator items[T](x: Option[T]): lent T =
+    if x.isSome:
+        yield x.unsafeGet
+
+proc parseMaxOccurs(x: string): int =
+    if x == "unbounded":
+        int.high
+    else:
+        parseInt(x)
+
+proc filterIdentChars(s: string): string =
+    result = newStringOfCap(s.len)
+    for c in s:
+        if c in IdentChars:
+            result.add c
+
+proc toExportedIdent(s: string): NimNode =
+    nnkPostfix.newTree(ident"*", s.filterIdentChars.ident)
+
+proc toTypeName(s: string): NimNode =
+    let
+        name = s.toExportedIdent
+        pragma = nnkPragma.newTree(nnkExprColonExpr.newTree(ident"xmlName", s.newLit))
+    nnkPragmaExpr.newTree(name, pragma)
+
+proc newPragma(s: string): NimNode =
+    nnkPragma.newTree(s.ident)
+
+proc xsdToNimPrimitiveType(s: string): string =
+    ## Takes an XSD primitive type, and converts it to a Nim type
+    ##
+    ## `xs:decimal` becomes `string` for the sake of keeping precision if
+    ## `xs:decimal` is a fixed-precision type (like money types).
+    case s
+    of "xs:string", "xs:decimal", "xs:date", "xs:dateTime": "string"
+    of "xs:boolean": "bool"
+    else: s
+
+macro addDiag(p) =
+    let body = p.body
+    p.body = quote do:
+        try:
+            `body`
+        except CatchableError:
+            let e = getCurrentException()
+            echo "Failed to parse for x = " & x.toJson.pretty & "\n" & e.msg &
+                "\n" & e.getStackTrace
+    result = p
+
+# {{{1 generation
+
+proc genField(x: XsElement, isopt: bool): NimNode {.addDiag.} =
+    let
+        baseTyp = x.typ.get.filterIdentChars.ident
+        minOccurs = x.minOccurs.get(1)
+        maxOccurs = x.maxOccurs.map(parseMaxOccurs).get(1)
+        name = x.name.toTypeName
+    let typ =
+        if minOccurs > 1 or maxOccurs > 1:
+            nnkBracketExpr.newTree(ident"seq", baseTyp)
+        elif isopt or (minOccurs == 0 and maxOccurs == 1):
+            nnkBracketExpr.newTree(ident"Option", baseTyp)
+        else:
+            baseTyp
+    result = newIdentDefs(name, typ)
+
+proc genField(x: XsAttribute): NimNode =
+    let
+        name = x.name.toTypeName
+        baseTyp = x.typ.filterIdentChars.ident
+        typ =
+            if x.use == "required":
+                baseTyp
+            else:
+                nnkBracketExpr.newTree(ident"Option", baseTyp)
+    newIdentDefs(name, typ)
+
+proc genType(x: XsComplexType): NimNode =
+    let recl = nnkRecList.newTree
+    for c in x.simpleContent:
+        let fld = nnkPragmaExpr.newTree(toExportedIdent"text", newPragma"xmlText")
+        recl.add newIdentDefs(fld, c.extension.base.ident)
+        for a in c.extension.attribute:
+            recl.add a.genField
+    for s in x.sequence:
+        for c in s.choice:
+            for e in c.element:
+                recl.add e.genField(true)
+        for e in s.element:
+            recl.add e.genField(false)
+    let
+        objty = nnkObjectTy.newTree(newEmptyNode(), newEmptyNode(), recl)
+        name = x.name.toExportedIdent
+    nnkTypeDef.newTree(name, newEmptyNode(), objty)
+
+proc toIdent(x: XsEnumeration): NimNode =
+    x.value.ident
+
+proc genType(x: XsSimpleType): NimNode =
+    let basename = x.name.get.toExportedIdent
+    let (name, typ) =
+        if x.restriction.enumeration.len > 0:
+            let
+                name = nnkPragmaExpr.newTree(basename, nnkPragma.newTree(ident"pure"))
+                ids = x.restriction.enumeration.map(toIdent)
+                en = nnkEnumTy.newTree(newEmptyNode())
+            en.add ids
+            (name, en)
+        else:
+            (basename, x.restriction.base.xsdToNimPrimitiveType.ident)
+    nnkTypeDef.newTree(name, newEmptyNode(), typ)
+
+proc genTypesFromStringAux*(s: string): NimNode =
+    # NOTE: This doesn't support comments in the beginning of the file!
+    let xsd = s.deserString[:XsSchema]("xs:schema").get
+    let types = nnkTypeSection
+        .newNimNode
+        .add(xsd.complexType.map(genType))
+        .add(xsd.simpleType.map(genType))
+    result = quote do:
+        import std/options, xmlserde
+        `types`
+
+macro xsdToNimStringify*(s: static string): static string =
+    result = genTypesFromStringAux(s).repr.strip.newLit
 
 when isMainModule:
-    import xmlparser
-    proc main(filename: string) =
-        let xml = loadXml(filename)
-        echo parseXsdToNim xml
+    const
+        xsdFile {.strdefine.}: string = ""
 
-    import cligen
-    dispatch main
+    static:
+        if xsdFile != "":
+            echo genTypesFromStringAux(xsdFile.slurp).repr
+
+    if xsdFile == "":
+        quit "Add `nim c` argument `-d:xsdFile=$PWD/$file` to " &
+            "the `$file` you want to generate bindings for"
