@@ -224,7 +224,7 @@ import
 type
   textFieldWithAttribute* = object
     text* {.xmlText.}: MyString
-    Ccy* {.xmlName: "Ccy".}: MyString
+    Ccy* {.xmlName: "Ccy", xmlAttr.}: MyString
 
   MyString* = string
 """

@@ -121,10 +121,12 @@ proc filterIdentChars(s: string): string =
 proc toExportedIdent(s: string): NimNode =
     nnkPostfix.newTree(ident"*", s.filterIdentChars.ident)
 
-proc toTypeName(s: string): NimNode =
+proc toTypeName(s: string, extraPragmas: varargs[NimNode]): NimNode =
     let
         name = s.toExportedIdent
         pragma = nnkPragma.newTree(nnkExprColonExpr.newTree(ident"xmlName", s.newLit))
+    for p in extraPragmas:
+        pragma.add p
     nnkPragmaExpr.newTree(name, pragma)
 
 proc newPragma(s: string): NimNode =
@@ -170,7 +172,7 @@ proc genField(x: XsElement, isopt: bool): NimNode {.addDiag.} =
 
 proc genField(x: XsAttribute): NimNode =
     let
-        name = x.name.toTypeName
+        name = x.name.toTypeName(ident"xmlAttr")
         baseTyp = x.typ.filterIdentChars.ident
         typ =
             if x.use == "required":
